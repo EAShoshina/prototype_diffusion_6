@@ -164,8 +164,7 @@ Non-trainable params: 0
 
 📎 Файл графа: [`assets/model.onnx`](assets/model.onnx)
 
-<!-- После получения скриншота замените путь ниже -->
-![Netron graph](assets/netron_screenshot.png)
+![Netron graph](assets/model_onnx.png)
 
 ---
 
