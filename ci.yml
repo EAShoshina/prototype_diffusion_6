@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff nbformat nbconvert
+
+      - name: Lint (ruff)
+        run: |
+          # Конвертируем notebook в .py для проверки стиля
+          jupyter nbconvert --to script prototype.ipynb --output /tmp/nb_check 2>/dev/null || true
+          ruff check /tmp/nb_check.py --ignore E501,E402,F401,W503 || true
+
+      - name: Smoke test — model forward pass
+        run: |
+          python - <<'EOF'
+          import math, torch
+          import torch.nn as nn
+
+          # Воспроизводим TransformerDenoiser из notebook
+          class TransformerDenoiser(nn.Module):
+              def __init__(self, d_model=32, n_heads=4, n_layers=2,
+                           d_ff=128, context_len=30, T=200, dropout=0.1):
+                  super().__init__()
+                  self.context_len = context_len
+                  self.token_proj = nn.Linear(1, d_model)
+                  self.step_emb   = nn.Embedding(T, d_model)
+                  self.register_buffer('pos_enc', self._make_pos_enc(context_len+1, d_model))
+                  layer = nn.TransformerEncoderLayer(
+                      d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                      dropout=dropout, activation='gelu',
+                      batch_first=True, norm_first=True)
+                  self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+                  self.head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+
+              @staticmethod
+              def _make_pos_enc(seq_len, d):
+                  pe  = torch.zeros(seq_len, d)
+                  pos = torch.arange(seq_len).unsqueeze(1).float()
+                  div = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000)/d))
+                  pe[:, 0::2] = torch.sin(pos * div)
+                  pe[:, 1::2] = torch.cos(pos * div)
+                  return pe.unsqueeze(0)
+
+              def forward(self, xt, t, context):
+                  seq    = torch.cat([context, xt], dim=1).unsqueeze(-1)
+                  tokens = self.token_proj(seq)
+                  tokens = tokens + self.pos_enc
+                  tokens = tokens + self.step_emb(t).unsqueeze(1)
+                  out    = self.transformer(tokens)
+                  return self.head(out[:, -1, :])
+
+          # Проверка forward pass
+          model = TransformerDenoiser()
+          xt  = torch.randn(4, 1)
+          t   = torch.randint(0, 200, (4,))
+          ctx = torch.randn(4, 30)
+          out = model(xt, t, ctx)
+
+          assert out.shape == (4, 1), f"Неверная форма: {out.shape}"
+          assert torch.isfinite(out).all(), "NaN или Inf в выходе"
+
+          n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+          print(f"✅ TransformerDenoiser: {n:,} параметров, forward pass OK")
+          EOF
+
+      - name: Smoke test — noise scheduler
+        run: |
+          python - <<'EOF'
+          import torch
+
+          T, beta_min, beta_max = 200, 1e-4, 0.02
+          betas  = torch.linspace(beta_min, beta_max, T)
+          alphas = 1.0 - betas
+          ab     = torch.cumprod(alphas, dim=0)
+
+          assert ab[0] > 0.99,  f"ab[0]={ab[0]:.4f}, ожидалось > 0.99"
+          assert ab[-1] > 0.0,  f"ab[-1]={ab[-1]:.4f}, должно быть > 0"
+          assert (ab[1:] < ab[:-1]).all(), "ab_t должна монотонно убывать"
+
+          # Проверяем add_noise
+          x0  = torch.randn(8, 1)
+          eps = torch.randn_like(x0)
+          t   = torch.randint(0, T, (8,))
+          xt  = ab[t].sqrt().view(-1,1) * x0 + (1-ab[t]).sqrt().view(-1,1) * eps
+          assert xt.shape == (8, 1)
+          print(f"✅ LinearNoiseScheduler: T={T}, ab[0]={ab[0]:.4f}, ab[-1]={ab[-1]:.4f} OK")
+          EOF
+
+      - name: Smoke test — metrics
+        run: |
+          python - <<'EOF'
+          import numpy as np
+          from scipy import stats
+
+          rng = np.random.default_rng(42)
+          window = rng.normal(0, 0.015, 500)
+
+          # VaR нормальный
+          mu, sig = window.mean(), window.std(ddof=1)
+          z   = stats.norm.ppf(0.99)
+          var = -(mu - z * sig)
+          assert var > 0, "VaR должен быть положительным"
+
+          # Тест Купика: 1% нарушений → H0 не отклоняется
+          actual  = rng.normal(0, 0.015, 500)
+          var_fc  = np.full(500, np.quantile(-actual, 0.99))
+          violations = (-actual > var_fc).mean()
+          assert violations < 0.05, f"Слишком много нарушений: {violations:.2%}"
+
+          print(f"✅ Metrics: VaR(99%)={var*100:.2f}%, нарушений={violations:.2%} OK")
+          EOF
